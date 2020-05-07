@@ -7,8 +7,10 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/fogleman/imview"
 	"github.com/nfnt/resize"
@@ -70,10 +72,17 @@ type Size struct {
 
 type ImageShape string
 
+type ImagePositionAndSize struct {
+	sp   image.Point
+	size Size
+}
+
 const (
-	RectangleShape ImageShape = "Rectangle"
-	CircleShape    ImageShape = "Circle"
-	CircleDiameter            = 0.8
+	RectangleShape   ImageShape = "Rectangle"
+	CircleShape      ImageShape = "Circle"
+	CircleDiameter              = 0.8
+	RectanglePadding            = 1
+	CirclePadding               = 20
 )
 
 func drawLine(img *image.RGBA, line_width int, space_from_end_x int, space_from_end_y int) {
@@ -115,11 +124,11 @@ func makeImageCollage(desiredWidth int, desiredHeight int, numberOfRows int, sha
 	numberOfColumns := len(images) / numberOfRows
 	imagesMatrix := make([][]image.Image, numberOfRows)
 
-	currentIndex := 0
+	numberOfColumnsAdded := 0
 	maxNumberOfColumns := 0
 	for idx := 0; idx < numberOfRows; idx++ {
 		columnsInRow := numberOfColumns
-		if len(images)%numberOfRows > 0 && (numberOfRows-idx)*numberOfColumns < len(images)-currentIndex {
+		if len(images)%numberOfRows > 0 && (numberOfRows-idx)*numberOfColumns < len(images)-numberOfColumnsAdded {
 			columnsInRow++
 		}
 
@@ -127,8 +136,8 @@ func makeImageCollage(desiredWidth int, desiredHeight int, numberOfRows int, sha
 			maxNumberOfColumns = columnsInRow
 		}
 
-		imagesMatrix[idx] = images[currentIndex : currentIndex+columnsInRow]
-		currentIndex += columnsInRow
+		imagesMatrix[idx] = images[numberOfColumnsAdded : numberOfColumnsAdded+columnsInRow]
+		numberOfColumnsAdded += columnsInRow
 	}
 
 	maxWidth := uint(0)
@@ -181,10 +190,16 @@ func makeImageCollage(desiredWidth int, desiredHeight int, numberOfRows int, sha
 		}
 	}
 
-	padding := 1
+	output := drawImagesOnBackground(numberOfRows, shape, desiredWidth, maxWidth, maxHeight, maxNumberOfColumns, imagesMatrix)
+
+	return output
+}
+
+func drawImagesOnBackground(numberOfRows int, shape ImageShape, desiredWidth int, maxWidth uint, maxHeight uint, maxNumberOfColumns int, imagesMatrix [][]image.Image) *MyImage {
+	padding := RectanglePadding
 
 	if shape == CircleShape {
-		padding = 20
+		padding = CirclePadding
 	}
 
 	rectangleEnd := image.Point{int(maxWidth) + (maxNumberOfColumns-1)*padding + 2*padding, int(maxHeight) + (numberOfRows-1)*padding + 2*padding}
@@ -197,12 +212,12 @@ func makeImageCollage(desiredWidth int, desiredHeight int, numberOfRows int, sha
 
 		calculatedWidth := math.Floor(float64(desiredWidth) / float64(len(imagesMatrix[row])))
 		for col := 0; col < len(imagesMatrix[row]); col++ {
-			resizeFactor := float64(1)
 			originalWidth := float64(Width(imagesMatrix[row][col]))
-			resizeFactor = calculatedWidth / originalWidth
+			originalHeight := float64(Height(imagesMatrix[row][col]))
+			resizeFactor := calculatedWidth / originalWidth
 
 			w := uint(originalWidth * resizeFactor)
-			h := uint(float64(Height(imagesMatrix[row][col])) * resizeFactor)
+			h := uint(originalHeight * resizeFactor)
 
 			if col == 0 {
 				sp_x = padding
@@ -239,39 +254,62 @@ func makeImageCollage(desiredWidth int, desiredHeight int, numberOfRows int, sha
 	return &output
 }
 
+// imagecollager will make a collage of images by combining them onto black background
+// Script parameters are:
+// 1. image shape - share for each inner image inside background - 'Rectangle' or 'Circle'
+// 2. number of rows in which images are displayed
+// 3. path to the directory where images are stored on file system
+
 func main() {
-	if len(os.Args) < 3 {
-		log.Fatal("No shape or number of rows defined")
+	if len(os.Args) != 6 {
+		log.Fatal("Invalid script call. Should be in format `go run imagecollager.go <Rectangle|Circle> <number of rows> <width> <height>")
 	} else {
 		imageShape := ImageShape(os.Args[1])
 		numberOfRows, errNr := strconv.Atoi(os.Args[2])
+		desiredWidth, errDw := strconv.Atoi(os.Args[3])
+		desiredHeight, errDh := strconv.Atoi(os.Args[4])
 
-		if errNr == nil && (imageShape == RectangleShape || imageShape == CircleShape) {
-			images := make([]image.Image, len(os.Args)-3)
+		if errNr == nil && errDw == nil && errDh == nil && (imageShape == RectangleShape || imageShape == CircleShape) {
+			readingImagesStart := time.Now()
+			var images []image.Image
+			dirName := os.Args[5]
+			err := filepath.Walk(dirName, func(path string, info os.FileInfo, e error) error {
+				if e != nil {
+					return e
+				}
 
-			for i := 3; i < len(os.Args); i++ {
-				fimg, _ := os.Open(os.Args[i])
-				defer fimg.Close()
-				img, _, _ := image.Decode(fimg)
+				if !info.IsDir() {
+					fimg, _ := os.Open(path)
+					defer fimg.Close()
+					img, _, imageError := image.Decode(fimg)
 
-				images[i-3] = img
+					if imageError == nil {
+						images = append(images, img)
+					}
+				}
+
+				return nil
+			})
+
+			readingImagesDuration := time.Since(readingImagesStart)
+			log.Print("Images read in " + readingImagesDuration.String())
+
+			if err != nil {
+				log.Fatal("Specified directory with images inside does not exists")
 			}
 
-			output := makeImageCollage(800, 800, numberOfRows, imageShape, images...)
+			makingCollageStart := time.Now()
+
+			output := makeImageCollage(desiredWidth, desiredHeight, numberOfRows, imageShape, images...)
+
+			makingCollageDuration := time.Since(makingCollageStart)
+
+			log.Print("Making image collage took " + makingCollageDuration.String())
+
 			imview.Show(output.value)
 		} else {
 			log.Fatal("No shape or number of rows defined")
 		}
 	}
-
-	// output := MyImage{image.NewRGBA(image.Rectangle{image.ZP, image.Point{400, 400}})}
-
-	// fimg, _ := os.Open("dog.jpg")
-	// defer fimg.Close()
-	// img, _, _ := image.Decode(fimg)
-	// output.drawRaw(img, image.Point{100, 100}, 180, 150)
-	// // output.drawInCircle(img, image.Point{100, 100}, 180, 180, 150)
-
-	// imview.Show(output.value)
 
 }
