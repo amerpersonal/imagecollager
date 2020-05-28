@@ -1,9 +1,11 @@
 package main
 
 import (
+	"errors"
 	"image"
 	"image/color"
 	"image/draw"
+	"io/ioutil"
 	"log"
 	"math"
 	"os"
@@ -190,9 +192,79 @@ func makeImageCollage(desiredWidth int, desiredHeight int, numberOfRows int, sha
 		}
 	}
 
-	output := drawImagesOnBackground(numberOfRows, shape, desiredWidth, maxWidth, maxHeight, maxNumberOfColumns, imagesMatrix)
+	// output := drawImagesOnBackground(numberOfRows, shape, desiredWidth, maxWidth, maxHeight, maxNumberOfColumns, imagesMatrix)
+	output := drawImagesOnBackgroundInParallel(numberOfRows, shape, maxWidth, maxHeight, maxNumberOfColumns, imagesMatrix, desiredWidth)
 
 	return output
+}
+
+func calculateImageStartingPointAndSize(img image.Image, imagesMatrix [][]image.Image, padding int, desiredWidth int, shape ImageShape) (ImagePositionAndSize, error) {
+	sp_y := padding
+	for row := range imagesMatrix {
+		sp_x := padding
+		calculatedColumnWidth := math.Floor(float64(desiredWidth) / float64(len(imagesMatrix[row])))
+		rowHeight := 0
+
+		for col := range imagesMatrix[row] {
+			originalWidth := float64(Width(imagesMatrix[row][col]))
+			originalHeight := float64(Height(imagesMatrix[row][col]))
+			resizeFactor := calculatedColumnWidth / originalWidth
+
+			w := uint(originalWidth * resizeFactor)
+			h := uint(originalHeight * resizeFactor)
+
+			if shape == CircleShape {
+				w = uint(math.Min(float64(w), float64(h)) * CircleDiameter)
+				h = w
+			}
+
+			if imagesMatrix[row][col] == img {
+				return ImagePositionAndSize{image.Point{sp_x, sp_y}, Size{w, h}}, nil
+			} else {
+				sp_x += int(w) + padding
+			}
+
+			if int(h) > rowHeight {
+				rowHeight = int(h)
+			}
+		}
+
+		sp_y += rowHeight + padding
+	}
+
+	return ImagePositionAndSize{image.Point{-1, -1}, Size{0, 0}}, errors.New("Image not found in matrix")
+}
+
+func drawSingleImageOnBackground(img image.Image, imagesMatrix [][]image.Image, padding int, shape ImageShape, desiredWidth int, background *MyImage) {
+	imageDetails, _ := calculateImageStartingPointAndSize(img, imagesMatrix, padding, desiredWidth, shape)
+	sp := imageDetails.sp
+	size := imageDetails.size
+
+	if shape == RectangleShape {
+		background.drawRaw(img, sp, size.width, size.height)
+	} else {
+		background.drawInCircle(img, sp, size.width, size.height, int(size.width))
+	}
+}
+
+func drawImagesOnBackgroundInParallel(numberOfRows int, shape ImageShape, maxWidth uint, maxHeight uint, maxNumberOfColumns int, imagesMatrix [][]image.Image, desiredWidth int) *MyImage {
+	padding := 1
+
+	if shape == CircleShape {
+		padding = 20
+	}
+
+	rectangleEnd := image.Point{int(maxWidth) + (maxNumberOfColumns-1)*padding + 2*padding, int(maxHeight) + (numberOfRows-1)*padding + 2*padding}
+
+	output := MyImage{image.NewRGBA(image.Rectangle{image.ZP, rectangleEnd})}
+
+	for r := range imagesMatrix {
+		for c := range imagesMatrix[r] {
+			go drawSingleImageOnBackground(imagesMatrix[r][c], imagesMatrix, padding, shape, desiredWidth, &output)
+		}
+	}
+
+	return &output
 }
 
 func drawImagesOnBackground(numberOfRows int, shape ImageShape, desiredWidth int, maxWidth uint, maxHeight uint, maxNumberOfColumns int, imagesMatrix [][]image.Image) *MyImage {
@@ -260,6 +332,76 @@ func drawImagesOnBackground(numberOfRows int, shape ImageShape, desiredWidth int
 // 2. number of rows in which images are displayed
 // 3. path to the directory where images are stored on file system
 
+func loadImage(path string, info os.FileInfo, images *[]image.Image) {
+	if !info.IsDir() {
+		fimg, _ := os.Open(path)
+		defer fimg.Close()
+		img, _, imageError := image.Decode(fimg)
+
+		if imageError == nil {
+			*images = append(*images, img)
+		}
+	}
+}
+
+func loadImageChannel(path string, info os.FileInfo, e error, images chan image.Image, errors chan error) {
+	if e != nil {
+		errors <- e
+		return
+	}
+
+	if !info.IsDir() {
+		fimg, _ := os.Open(path)
+		defer fimg.Close()
+		img, _, imageError := image.Decode(fimg)
+
+		if imageError == nil {
+			images <- img
+		} else {
+			errors <- imageError
+		}
+	}
+}
+
+func countFiles(dirPath string) (int, error) {
+	files, err := ioutil.ReadDir(dirPath)
+	if err != nil {
+		return 0, err
+	}
+
+	counter := 0
+	for _, file := range files {
+		if !file.IsDir() {
+			counter++
+		}
+	}
+
+	return counter, nil
+}
+
+func loadImagesChannel(dirName string, images chan image.Image, quit chan int, errors chan error) {
+	err := filepath.Walk(dirName, func(path string, info os.FileInfo, e error) error {
+		if e != nil {
+			errors <- e
+		}
+
+		if !info.IsDir() {
+			fimg, _ := os.Open(path)
+			defer fimg.Close()
+			img, _, imageError := image.Decode(fimg)
+			if imageError == nil {
+				images <- img
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		errors <- err
+	} else {
+		quit <- 1
+	}
+}
+
 func main() {
 	if len(os.Args) != 6 {
 		log.Fatal("Invalid script call. Should be in format `go run imagecollager.go <Rectangle|Circle> <number of rows> <width> <height>")
@@ -273,40 +415,40 @@ func main() {
 			readingImagesStart := time.Now()
 			var images []image.Image
 			dirName := os.Args[5]
-			err := filepath.Walk(dirName, func(path string, info os.FileInfo, e error) error {
-				if e != nil {
-					return e
-				}
 
-				if !info.IsDir() {
-					fimg, _ := os.Open(path)
-					defer fimg.Close()
-					img, _, imageError := image.Decode(fimg)
+			imagesChannel := make(chan image.Image)
+			errChannel := make(chan error)
 
-					if imageError == nil {
-						images = append(images, img)
-					}
-				}
+			imagesCount, _ := countFiles(dirName)
 
+			_ = filepath.Walk(dirName, func(path string, info os.FileInfo, e error) error {
+				go loadImageChannel(path, info, e, imagesChannel, errChannel)
 				return nil
 			})
 
-			readingImagesDuration := time.Since(readingImagesStart)
-			log.Print("Images read in " + readingImagesDuration.String())
+			for {
+				select {
+				case img := <-imagesChannel:
+					images = append(images, img)
 
-			if err != nil {
-				log.Fatal("Specified directory with images inside does not exists")
+					if len(images) == imagesCount {
+						readingImagesDuration := time.Since(readingImagesStart)
+						log.Print(strconv.Itoa(len(images)) + "Images read in " + readingImagesDuration.String())
+
+						makingCollageStart := time.Now()
+
+						output := makeImageCollage(desiredWidth, desiredHeight, numberOfRows, imageShape, images...)
+
+						makingCollageDuration := time.Since(makingCollageStart)
+
+						log.Print("Making image collage took " + makingCollageDuration.String())
+
+						imview.Show(output.value)
+					}
+				case <-errChannel:
+					log.Fatal("Specified directory with images inside does not exists")
+				}
 			}
-
-			makingCollageStart := time.Now()
-
-			output := makeImageCollage(desiredWidth, desiredHeight, numberOfRows, imageShape, images...)
-
-			makingCollageDuration := time.Since(makingCollageStart)
-
-			log.Print("Making image collage took " + makingCollageDuration.String())
-
-			imview.Show(output.value)
 		} else {
 			log.Fatal("No shape or number of rows defined")
 		}
